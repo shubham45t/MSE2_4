@@ -52,7 +52,7 @@ PORT_SCAN_WINDOW = int(os.getenv("PORT_SCAN_WINDOW", "10"))
 IGNORE_PRIVATE_TO_PRIVATE = _read_bool("IGNORE_PRIVATE_TO_PRIVATE", False)
 
 ENABLE_AUTO_BLOCK = _read_bool("ENABLE_AUTO_BLOCK", False)
-AUTO_BLOCK_ON = os.getenv("AUTO_BLOCK_ON", "CRITICAL").strip().upper()
+AUTO_BLOCK_ON = [s.strip().upper() for s in os.getenv("AUTO_BLOCK_ON", "CRITICAL").split(",")]
 
 THREAT_API_URL = os.getenv("THREAT_API_URL", "https://api.abuseipdb.com/api/v2/check")
 API_KEY = os.getenv("API_KEY", "").strip()
@@ -178,7 +178,7 @@ class NIDS:
         self.scanned_ports: defaultdict[tuple[str, str], Deque[tuple[float, int]]] = defaultdict(deque)
         self.geo_cache: dict[str, str] = {}
         self.abuse_cache: dict[str, bool] = {}
-        self.blocked_ips: set[str] = set()
+        self.blocked_ips: dict[str, str] = {}
         self.last_alert_time: defaultdict[tuple[str, str], float] = defaultdict(float)
         self.active_attacks: dict[tuple[str, str, int | None, str], float] = {}
         self.logger = JSONFileLogger(LOG_FILE_PATH)
@@ -189,16 +189,19 @@ class NIDS:
             return
         try:
             with open(BLOCKED_IPS_PATH, "r", encoding="utf-8") as file:
-                ips = json.load(file)
-            if isinstance(ips, list):
-                self.blocked_ips.update(str(ip) for ip in ips)
+                data = json.load(file)
+            if isinstance(data, dict):
+                self.blocked_ips.update(data)
+            elif isinstance(data, list):
+                for ip in data:
+                    self.blocked_ips[str(ip)] = "CRITICAL"
         except Exception as exc:
             print(f"[ERROR] failed to load blocked IPs: {exc}")
 
     def _save_blocked_ips(self) -> None:
         try:
             with open(BLOCKED_IPS_PATH, "w", encoding="utf-8") as file:
-                json.dump(sorted(self.blocked_ips), file, indent=2)
+                json.dump(self.blocked_ips, file, indent=2)
         except Exception as exc:
             print(f"[ERROR] failed to save blocked IPs: {exc}")
 
@@ -247,11 +250,11 @@ class NIDS:
         self.geo_cache[ip] = geo
         return geo
 
-    def auto_block(self, ip: str) -> bool:
+    def auto_block(self, ip: str, severity: str) -> bool:
         if not ENABLE_AUTO_BLOCK:
             return False
 
-        if ip in self.blocked_ips or is_self_ip(ip) or is_trusted_ip(ip) or is_local_ip(ip):
+        if ip in self.blocked_ips or is_self_ip(ip) or is_trusted_ip(ip):
             return False
 
         commands = [
@@ -266,7 +269,7 @@ class NIDS:
                 subprocess.run(commands[1], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 subprocess.run(commands[2], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-            self.blocked_ips.add(ip)
+            self.blocked_ips[ip] = severity
             self._save_blocked_ips()
             print(f"[AUTO-RESPONSE] Blocked {ip} via iptables")
             return True
@@ -372,9 +375,15 @@ class NIDS:
 
         if src_ip in self.blocked_ips or dst_ip in self.blocked_ips:
             blocked_ip = src_ip if src_ip in self.blocked_ips else dst_ip
+            now = time.time()
+            if now - self.last_alert_time[("BLOCKED", blocked_ip)] < 60:
+                return
+            self.last_alert_time[("BLOCKED", blocked_ip)] = now
+
             geo = self.get_geo(blocked_ip)
+            blocked_severity = self.blocked_ips.get(blocked_ip, "HIGH")
             self.trigger_alert(
-                "CRITICAL",
+                blocked_severity,
                 "Blocked IP Traffic Dropped",
                 "Blocked IP",
                 geo,
@@ -510,8 +519,8 @@ class NIDS:
             ", ".join(reasons),
         )
 
-        if ENABLE_AUTO_BLOCK and severity == AUTO_BLOCK_ON:
-            self.auto_block(src_ip)
+        if ENABLE_AUTO_BLOCK and severity in AUTO_BLOCK_ON:
+            self.auto_block(src_ip, severity)
 
     def analyze_packet_safe(self, packet) -> None:
         try:

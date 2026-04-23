@@ -61,6 +61,8 @@ def read_blocked_ips() -> list[str]:
             data = json.load(file)
         if isinstance(data, list):
             return sorted(str(ip) for ip in data)
+        elif isinstance(data, dict):
+            return sorted(str(ip) for ip in data.keys())
     except Exception:
         pass
     return []
